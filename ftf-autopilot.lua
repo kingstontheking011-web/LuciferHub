@@ -159,9 +159,13 @@ end
 --=====================================================================
 local State = {
 	on         = false,     -- autopilot master
-	mode       = "hold",    -- "hold" | "locked"
+	mode       = "hold",    -- "hold" | "locked" | "points"
 	aim        = nil,       -- {x=,y=} captured mx,my for locked mode
-	capturing  = false,     -- arm aim capture on next frame
+	capturing  = false,     -- arm single-aim capture on next frame
+	points     = {},        -- up to 5 {x,y} aim points for "points" cycle mode
+	ptIdx      = 1,         -- which point the cycle is on right now
+	ptDwell    = 1,         -- ticks spent per point before advancing (1 = fastest)
+	ptTick     = 0,         -- internal dwell counter
 	walk       = 0,         -- -1 / 0 / 1, forced movement (0 = leave game's)
 	advance    = true,      -- auto-skip cutscenes (dead-time killer)
 	autoRevive = false,     -- tap the revive button on death (opt-in)
@@ -217,7 +221,6 @@ local function installHook()
 				State.aim = { x = frame.mx or 0, y = frame.my or 0 }
 				State.capturing = false
 			end
-
 			if State.on then
 				local st = simState()
 				-- Count a new round each time we transition INTO "round".
@@ -243,6 +246,17 @@ local function installHook()
 					if State.mode == "locked" and State.aim then
 						frame.mx = State.aim.x
 						frame.my = State.aim.y
+					elseif State.mode == "points" and #State.points > 0 then
+						-- POINT CYCLE: aim at the current point, then step to the next
+						-- after ptDwell ticks (1 = flick to a new point every tick).
+						local p = State.points[State.ptIdx] or State.points[1]
+						frame.mx = p.x
+						frame.my = p.y
+						State.ptTick += 1
+						if State.ptTick >= State.ptDwell then
+							State.ptTick = 0
+							State.ptIdx = (State.ptIdx % #State.points) + 1
+						end
 					end
 					if State.walk ~= 0 then
 						frame.walk = State.walk
@@ -396,16 +410,19 @@ end
 
 local btnMaster  = mkButton("▶  START", 2, Color3.fromRGB(32, 90, 44))
 local btnMode    = mkButton("Mode: Hold-only", 3)
-local btnAdvance = mkButton("Auto-advance: ON (skip cutscenes)", 4)
-local btnCapture = mkButton("📍  Lock Aim (point first)", 5)
-local btnWalk    = mkButton("Walk: Off", 6)
-local btnRevive  = mkButton("Auto-revive: OFF", 7)
-local btnIdle    = mkButton("Anti-idle: ON", 8)
-local btnRejoin  = mkButton("Auto-rejoin: OFF", 9)
+local btnAddPt   = mkButton("➕ Add Point (0/5)", 4)
+local btnClearPt = mkButton("🗑 Clear Points", 5)
+local btnSpeed   = mkButton("Cycle speed: 1 tick/pt", 6)
+local btnCapture = mkButton("📍  Lock Aim (point first)", 7)
+local btnAdvance = mkButton("Auto-advance: ON (skip cutscenes)", 8)
+local btnWalk    = mkButton("Walk: Off", 9)
+local btnRevive  = mkButton("Auto-revive: OFF", 10)
+local btnIdle    = mkButton("Anti-idle: ON", 11)
+local btnRejoin  = mkButton("Auto-rejoin: OFF", 12)
 
 -- Cap input row
 local capBox = Instance.new("TextBox")
-capBox.LayoutOrder        = 10
+capBox.LayoutOrder        = 13
 capBox.Size               = UDim2.new(1, 0, 0, 30)
 capBox.BackgroundColor3   = Color3.fromRGB(40, 36, 44)
 capBox.Font               = Enum.Font.Gotham
@@ -418,9 +435,9 @@ capBox.BorderSizePixel    = 0
 capBox.Parent             = root
 Instance.new("UICorner", capBox).CornerRadius = UDim.new(0, 8)
 
-local lblEmbers = mkLabel(11)
-local lblStats  = mkLabel(12)
-local lblStatus = mkLabel(13)
+local lblEmbers = mkLabel(14)
+local lblStats  = mkLabel(15)
+local lblStatus = mkLabel(16)
 
 --=====================================================================
 --  6. DRAG  (touch + mouse)
@@ -460,8 +477,16 @@ end
 --  7. WIRING
 --=====================================================================
 -- Reflect State onto every toggle's label.
+local function modeName()
+	return (State.mode == "hold" and "Hold-only")
+		or (State.mode == "locked" and "Locked aim")
+		or "Points cycle"
+end
+
 local function refreshButtons()
-	btnMode.Text    = (State.mode == "hold") and "Mode: Hold-only" or "Mode: Locked aim"
+	btnMode.Text    = "Mode: " .. modeName()
+	btnAddPt.Text   = string.format("➕ Add Point (%d/5)", #State.points)
+	btnSpeed.Text   = "Cycle speed: " .. State.ptDwell .. " tick/pt"
 	btnAdvance.Text = "Auto-advance: " .. (State.advance and "ON (skip cutscenes)" or "OFF")
 	btnWalk.Text    = "Walk: " .. (State.walk == 0 and "Off" or (State.walk < 0 and "◀ Left" or "Right ▶"))
 	btnRevive.Text  = "Auto-revive: " .. (State.autoRevive and "ON" or "OFF")
@@ -484,6 +509,7 @@ local function saveCfg()
 			mode = State.mode, walk = State.walk, advance = State.advance,
 			autoRevive = State.autoRevive, antiIdle = State.antiIdle,
 			autoRejoin = State.autoRejoin, cap = State.cap, aim = State.aim,
+			points = State.points, ptDwell = State.ptDwell,
 		}))
 	end)
 end
@@ -510,6 +536,19 @@ local function loadCfg()
 				and type(d.aim.y) == "number" then
 				State.aim = { x = d.aim.x, y = d.aim.y }
 			end
+			if type(d.ptDwell) == "number" and d.ptDwell >= 1 then
+				State.ptDwell = math.floor(d.ptDwell)
+			end
+			if type(d.points) == "table" then
+				local pts = {}
+				for _, p in ipairs(d.points) do
+					if type(p) == "table" and type(p.x) == "number"
+						and type(p.y) == "number" and #pts < 5 then
+						pts[#pts + 1] = { x = p.x, y = p.y }
+					end
+				end
+				State.points = pts
+			end
 		end
 	end
 	refreshButtons()
@@ -532,10 +571,45 @@ btnMaster.MouseButton1Click:Connect(function()
 end)
 
 btnMode.MouseButton1Click:Connect(function()
-	State.mode = (State.mode == "hold") and "locked" or "hold"
-	btnMode.Text = (State.mode == "hold")
-		and "Mode: Hold-only"
-		or  "Mode: Locked aim"
+	-- hold -> locked -> points -> hold
+	State.mode = (State.mode == "hold" and "locked")
+		or (State.mode == "locked" and "points")
+		or "hold"
+	btnMode.Text = "Mode: " .. modeName()
+	saveCfg()
+end)
+
+btnAddPt.MouseButton1Click:Connect(function()
+	-- Capture where you're pointing right now as the next cycle point (max 5).
+	if #State.points >= 5 then
+		btnAddPt.Text = "➕ Full (5/5) — Clear first"
+		task.delay(1.2, function()
+			btnAddPt.Text = string.format("➕ Add Point (%d/5)", #State.points)
+		end)
+		return
+	end
+	State.points[#State.points + 1] = { x = State.lastAim.x, y = State.lastAim.y }
+	btnAddPt.Text = string.format("➕ Added #%d (%d/5)", #State.points, #State.points)
+	task.delay(1.2, function()
+		btnAddPt.Text = string.format("➕ Add Point (%d/5)", #State.points)
+	end)
+	saveCfg()
+end)
+
+btnClearPt.MouseButton1Click:Connect(function()
+	State.points = {}
+	State.ptIdx, State.ptTick = 1, 0
+	btnAddPt.Text = "➕ Add Point (0/5)"
+	saveCfg()
+end)
+
+btnSpeed.MouseButton1Click:Connect(function()
+	-- Cycle through dwell values: 1 -> 2 -> 4 -> 8 -> 1 ticks per point.
+	State.ptDwell = (State.ptDwell == 1 and 2)
+		or (State.ptDwell == 2 and 4)
+		or (State.ptDwell == 4 and 8)
+		or 1
+	btnSpeed.Text = "Cycle speed: " .. State.ptDwell .. " tick/pt"
 	saveCfg()
 end)
 
@@ -596,8 +670,8 @@ end)
 
 -- Minimize: hide body controls; the auto-sized panel shrinks to the title.
 local bodyControls = {
-	btnMaster, btnMode, btnAdvance, btnCapture, btnWalk,
-	btnRevive, btnIdle, btnRejoin, capBox, lblEmbers, lblStats, lblStatus,
+	btnMaster, btnMode, btnAddPt, btnClearPt, btnSpeed, btnCapture, btnAdvance,
+	btnWalk, btnRevive, btnIdle, btnRejoin, capBox, lblEmbers, lblStats, lblStatus,
 }
 local function setMinimized(v)
 	State.minimized = v
@@ -662,9 +736,12 @@ task.spawn(function()
 			local act = (State.phase == "round") and "FEEDING"
 				or (State.phase == "cutscene" and State.advance) and "SKIPPING"
 				or "WAITING"
+			local extra = ""
+			if State.mode == "points" and #State.points > 0 then
+				extra = string.format(" · pt %d/%d", State.ptIdx, #State.points)
+			end
 			lblStatus.Text = string.format(
-				"%s · phase %s · forced %d · pend %d",
-				act, State.phase, State.forced, pend)
+				"%s · %s%s · pend %d", act, State.phase, extra, pend)
 		end
 		task.wait(0.5)
 	end
