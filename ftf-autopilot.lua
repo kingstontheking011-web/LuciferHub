@@ -163,21 +163,26 @@ local State = {
 	aim       = nil,       -- {x=,y=} captured mx,my for locked mode
 	capturing = false,     -- arm aim capture on next frame
 	walk      = 0,         -- -1 / 0 / 1, forced movement (0 = leave game's)
+	advance   = true,      -- auto-skip cutscenes (dead-time killer)
 	cap       = 1e12,      -- auto-stop embers threshold (keep < 1e15)
 	forced    = 0,         -- count of frames we've forced (rate feedback)
 	lastAim   = {x = 0, y = 0}, -- last seen live aim (for quick-lock)
 	embers    = nil,       -- throttled readout
+	phase     = "?",       -- last read sim.state() for the status line
 	installed = false,
 }
 local HARD_CLAMP = 1e15    -- SaveGuard.sanitise embers ceiling
 
--- True when the shop/upgrade panel is open — we must NOT force down then, or
--- the locked aim would click shop buttons at the wrong coordinate. Declared
--- before the hook so the hook closure captures it as an upvalue.
-local function shopIsOpen()
-	if not Found.sim then return false end
-	local ok, v = pcall(Found.sim.shopOpen)
-	return ok and v == true
+-- Current phase string from the sim: "round","won","dead","flash","rain",
+-- "intro","cutscene","results","upgrade","rearrange","board","menu","place",
+-- "zed". Light (returns one upvalue). Declared before the hook so the hook
+-- closure captures it. We only FEED during "round" — fuel exists only then,
+-- and forcing down in menu/shop/results phases would click UI at the aim.
+local function simState()
+	if not Found.sim then return nil end
+	local ok, v = pcall(Found.sim.state)
+	if ok and type(v) == "string" then return v end
+	return nil
 end
 
 --=====================================================================
@@ -202,18 +207,33 @@ local function installHook()
 				State.capturing = false
 			end
 
-			if State.on and not shopIsOpen() then
-				-- Force the productive input. This mutates the frame BEFORE it is
-				-- recorded, so both the local sim tick and the streamed buffer use it.
-				frame.down = true
-				if State.mode == "locked" and State.aim then
-					frame.mx = State.aim.x
-					frame.my = State.aim.y
+			if State.on then
+				local st = simState()
+				State.phase = st or "?"
+
+				if st == "round" or st == nil then
+					-- FEED: force fire held at a valid aim. Mutating the frame BEFORE
+					-- origPush means the local sim tick AND the streamed buffer both
+					-- carry it — the server replays identical productive input.
+					-- st == nil => sim wasn't found; fall back to always-feed so the
+					-- recorder-only case still works (you just lose phase gating).
+					frame.down = true
+					if State.mode == "locked" and State.aim then
+						frame.mx = State.aim.x
+						frame.my = State.aim.y
+					end
+					if State.walk ~= 0 then
+						frame.walk = State.walk
+					end
+					State.forced += 1
+				elseif st == "cutscene" and State.advance then
+					-- AUTO-ADVANCE: hold skip through story cutscenes (0.85s skips to
+					-- intro). Cosmetic-only; never touches down, so no misclicks.
+					frame.skip = true
 				end
-				if State.walk ~= 0 then
-					frame.walk = State.walk
-				end
-				State.forced += 1
+				-- Any other phase (won/dead/intro/flash/rain/results/upgrade/menu/…)
+				-- is left untouched — those advance on their own timers, and forcing
+				-- down there would click menus/shops at the locked coordinate.
 			end
 		end
 		return origPush(frame)
@@ -268,7 +288,7 @@ local root = Instance.new("Frame")
 root.Name                   = "Root"
 root.AnchorPoint            = Vector2.new(0, 0)
 root.Position               = UDim2.fromOffset(16, 90)
-root.Size                   = UDim2.fromOffset(250, 286)
+root.Size                   = UDim2.fromOffset(250, 328)
 root.BackgroundColor3       = Color3.fromRGB(18, 16, 20)
 root.BackgroundTransparency = 0.05
 root.BorderSizePixel        = 0
@@ -338,12 +358,13 @@ end
 
 local btnMaster  = mkButton("▶  START", 2, Color3.fromRGB(32, 90, 44))
 local btnMode    = mkButton("Mode: Hold-only", 3)
-local btnCapture = mkButton("📍  Lock Aim (point first)", 4)
-local btnWalk    = mkButton("Walk: Off", 5)
+local btnAdvance = mkButton("Auto-advance: ON (skip cutscenes)", 4)
+local btnCapture = mkButton("📍  Lock Aim (point first)", 5)
+local btnWalk    = mkButton("Walk: Off", 6)
 
 -- Cap input row
 local capBox = Instance.new("TextBox")
-capBox.LayoutOrder        = 6
+capBox.LayoutOrder        = 7
 capBox.Size               = UDim2.new(1, 0, 0, 30)
 capBox.BackgroundColor3   = Color3.fromRGB(40, 36, 44)
 capBox.Font               = Enum.Font.Gotham
@@ -356,8 +377,8 @@ capBox.BorderSizePixel    = 0
 capBox.Parent             = root
 Instance.new("UICorner", capBox).CornerRadius = UDim.new(0, 8)
 
-local lblEmbers = mkLabel(7)
-local lblStatus = mkLabel(8)
+local lblEmbers = mkLabel(8)
+local lblStatus = mkLabel(9)
 
 --=====================================================================
 --  6. DRAG  (touch + mouse)
@@ -419,6 +440,13 @@ btnMode.MouseButton1Click:Connect(function()
 		or  "Mode: Locked aim"
 end)
 
+btnAdvance.MouseButton1Click:Connect(function()
+	State.advance = not State.advance
+	btnAdvance.Text = State.advance
+		and "Auto-advance: ON (skip cutscenes)"
+		or  "Auto-advance: OFF"
+end)
+
 btnCapture.MouseButton1Click:Connect(function()
 	-- Lock to the aim seen on the very next streamed frame (point first, then tap).
 	State.capturing = true
@@ -477,8 +505,12 @@ task.spawn(function()
 				local ok, p = pcall(Found.recorder.pendingTicks)
 				if ok then pend = p end
 			end
+			local act = (State.phase == "round") and "FEEDING"
+				or (State.phase == "cutscene" and State.advance) and "SKIPPING"
+				or "WAITING"
 			lblStatus.Text = string.format(
-				"Status: FEEDING · forced %d · pend %d", State.forced, pend)
+				"%s · phase %s · forced %d · pend %d",
+				act, State.phase, State.forced, pend)
 		end
 		task.wait(0.5)
 	end
