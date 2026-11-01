@@ -158,20 +158,31 @@ end
 --  2. STATE / CONFIG
 --=====================================================================
 local State = {
-	on        = false,     -- autopilot master
-	mode      = "hold",    -- "hold" | "locked"
-	aim       = nil,       -- {x=,y=} captured mx,my for locked mode
-	capturing = false,     -- arm aim capture on next frame
-	walk      = 0,         -- -1 / 0 / 1, forced movement (0 = leave game's)
-	advance   = true,      -- auto-skip cutscenes (dead-time killer)
-	cap       = 1e12,      -- auto-stop embers threshold (keep < 1e15)
-	forced    = 0,         -- count of frames we've forced (rate feedback)
-	lastAim   = {x = 0, y = 0}, -- last seen live aim (for quick-lock)
-	embers    = nil,       -- throttled readout
-	phase     = "?",       -- last read sim.state() for the status line
-	installed = false,
+	on         = false,     -- autopilot master
+	mode       = "hold",    -- "hold" | "locked"
+	aim        = nil,       -- {x=,y=} captured mx,my for locked mode
+	capturing  = false,     -- arm aim capture on next frame
+	walk       = 0,         -- -1 / 0 / 1, forced movement (0 = leave game's)
+	advance    = true,      -- auto-skip cutscenes (dead-time killer)
+	autoRevive = false,     -- tap the revive button on death (opt-in)
+	antiIdle   = true,      -- defeat the 20-min AFK kick
+	autoRejoin = false,     -- teleport back in on disconnect (opt-in)
+	cap        = 1e12,      -- auto-stop embers threshold (keep < 1e15)
+	forced     = 0,         -- count of frames we've forced (rate feedback)
+	lastAim    = {x = 0, y = 0}, -- last seen live aim (for quick-lock)
+	embers     = nil,       -- throttled readout
+	phase      = "?",       -- last read sim.state() for the status line
+	lastPhase  = "?",       -- previous phase (for round-transition counting)
+	rounds     = 0,         -- rounds entered this session
+	startEmbers = nil,      -- embers when autopilot first started (session base)
+	rate       = 0,         -- embers/sec (rolling)
+	_rT        = 0,         -- last rate-sample clock
+	_rE        = nil,       -- last rate-sample embers
+	minimized  = false,
+	installed  = false,
 }
 local HARD_CLAMP = 1e15    -- SaveGuard.sanitise embers ceiling
+local REVIVE_C  = { x = 480, y = 300 } -- centre of REVIVE_BTN {330,273,300,54}
 
 -- Current phase string from the sim: "round","won","dead","flash","rain",
 -- "intro","cutscene","results","upgrade","rearrange","board","menu","place",
@@ -209,9 +220,20 @@ local function installHook()
 
 			if State.on then
 				local st = simState()
+				-- Count a new round each time we transition INTO "round".
+				if st == "round" and State.lastPhase ~= "round" then
+					State.rounds += 1
+				end
+				State.lastPhase = st or State.lastPhase
 				State.phase = st or "?"
 
-				if st == "round" or st == nil then
+				if st == "dead" and State.autoRevive then
+					-- AUTO-REVIVE: tap the revive button (server replays the click).
+					-- If no revive is offered, this coordinate is harmless.
+					frame.down = true
+					frame.mx   = REVIVE_C.x
+					frame.my   = REVIVE_C.y
+				elseif st == "round" or st == nil then
 					-- FEED: force fire held at a valid aim. Mutating the frame BEFORE
 					-- origPush means the local sim tick AND the streamed buffer both
 					-- carry it — the server replays identical productive input.
@@ -288,7 +310,8 @@ local root = Instance.new("Frame")
 root.Name                   = "Root"
 root.AnchorPoint            = Vector2.new(0, 0)
 root.Position               = UDim2.fromOffset(16, 90)
-root.Size                   = UDim2.fromOffset(250, 328)
+root.Size                   = UDim2.fromOffset(250, 0)
+root.AutomaticSize          = Enum.AutomaticSize.Y  -- grows/shrinks to content
 root.BackgroundColor3       = Color3.fromRGB(18, 16, 20)
 root.BackgroundTransparency = 0.05
 root.BorderSizePixel        = 0
@@ -323,6 +346,21 @@ title.TextSize           = 14
 title.TextColor3         = Color3.fromRGB(255, 180, 90)
 title.TextXAlignment     = Enum.TextXAlignment.Left
 title.Parent             = root
+
+-- Minimize button lives inside the title (not in the list layout).
+local btnMin = Instance.new("TextButton")
+btnMin.Name                 = "Min"
+btnMin.AnchorPoint          = Vector2.new(1, 0.5)
+btnMin.Position             = UDim2.new(1, 0, 0.5, 0)
+btnMin.Size                 = UDim2.fromOffset(24, 20)
+btnMin.BackgroundColor3     = Color3.fromRGB(40, 36, 44)
+btnMin.Font                 = Enum.Font.GothamBold
+btnMin.TextSize             = 14
+btnMin.TextColor3           = Color3.fromRGB(240, 240, 240)
+btnMin.Text                 = "–"
+btnMin.BorderSizePixel      = 0
+btnMin.Parent               = title
+Instance.new("UICorner", btnMin).CornerRadius = UDim.new(0, 6)
 
 -- Helper: make a full-width button
 local function mkButton(text, order, color)
@@ -361,10 +399,13 @@ local btnMode    = mkButton("Mode: Hold-only", 3)
 local btnAdvance = mkButton("Auto-advance: ON (skip cutscenes)", 4)
 local btnCapture = mkButton("📍  Lock Aim (point first)", 5)
 local btnWalk    = mkButton("Walk: Off", 6)
+local btnRevive  = mkButton("Auto-revive: OFF", 7)
+local btnIdle    = mkButton("Anti-idle: ON", 8)
+local btnRejoin  = mkButton("Auto-rejoin: OFF", 9)
 
 -- Cap input row
 local capBox = Instance.new("TextBox")
-capBox.LayoutOrder        = 7
+capBox.LayoutOrder        = 10
 capBox.Size               = UDim2.new(1, 0, 0, 30)
 capBox.BackgroundColor3   = Color3.fromRGB(40, 36, 44)
 capBox.Font               = Enum.Font.Gotham
@@ -377,8 +418,9 @@ capBox.BorderSizePixel    = 0
 capBox.Parent             = root
 Instance.new("UICorner", capBox).CornerRadius = UDim.new(0, 8)
 
-local lblEmbers = mkLabel(8)
-local lblStatus = mkLabel(9)
+local lblEmbers = mkLabel(11)
+local lblStats  = mkLabel(12)
+local lblStatus = mkLabel(13)
 
 --=====================================================================
 --  6. DRAG  (touch + mouse)
@@ -417,6 +459,62 @@ end
 --=====================================================================
 --  7. WIRING
 --=====================================================================
+-- Reflect State onto every toggle's label.
+local function refreshButtons()
+	btnMode.Text    = (State.mode == "hold") and "Mode: Hold-only" or "Mode: Locked aim"
+	btnAdvance.Text = "Auto-advance: " .. (State.advance and "ON (skip cutscenes)" or "OFF")
+	btnWalk.Text    = "Walk: " .. (State.walk == 0 and "Off" or (State.walk < 0 and "◀ Left" or "Right ▶"))
+	btnRevive.Text  = "Auto-revive: " .. (State.autoRevive and "ON" or "OFF")
+	btnIdle.Text    = "Anti-idle: " .. (State.antiIdle and "ON" or "OFF")
+	btnRejoin.Text  = "Auto-rejoin: " .. (State.autoRejoin and "ON" or "OFF")
+	capBox.Text     = tostring(State.cap)
+end
+
+-- Settings persistence (executor filesystem; all guarded — never load-bearing).
+local CFG_PATH    = "ftf_autopilot.json"
+local HttpService = game:GetService("HttpService")
+local _writefile  = writefile or G.writefile
+local _readfile   = readfile  or G.readfile
+local _isfile     = isfile    or G.isfile
+
+local function saveCfg()
+	if not _writefile then return end
+	pcall(function()
+		_writefile(CFG_PATH, HttpService:JSONEncode({
+			mode = State.mode, walk = State.walk, advance = State.advance,
+			autoRevive = State.autoRevive, antiIdle = State.antiIdle,
+			autoRejoin = State.autoRejoin, cap = State.cap, aim = State.aim,
+		}))
+	end)
+end
+
+local function loadCfg()
+	if not _readfile then return end
+	local ok, raw = pcall(function()
+		if _isfile and not _isfile(CFG_PATH) then return nil end
+		return _readfile(CFG_PATH)
+	end)
+	if ok and type(raw) == "string" then
+		local ok2, d = pcall(function() return HttpService:JSONDecode(raw) end)
+		if ok2 and type(d) == "table" then
+			if type(d.mode) == "string" then State.mode = d.mode end
+			if type(d.walk) == "number" then State.walk = d.walk end
+			if type(d.advance) == "boolean" then State.advance = d.advance end
+			if type(d.autoRevive) == "boolean" then State.autoRevive = d.autoRevive end
+			if type(d.antiIdle) == "boolean" then State.antiIdle = d.antiIdle end
+			if type(d.autoRejoin) == "boolean" then State.autoRejoin = d.autoRejoin end
+			if type(d.cap) == "number" and d.cap > 0 then
+				State.cap = math.min(d.cap, HARD_CLAMP * 0.999)
+			end
+			if type(d.aim) == "table" and type(d.aim.x) == "number"
+				and type(d.aim.y) == "number" then
+				State.aim = { x = d.aim.x, y = d.aim.y }
+			end
+		end
+	end
+	refreshButtons()
+end
+
 local function setMaster(v)
 	State.on = v and State.installed
 	if State.on then
@@ -438,6 +536,7 @@ btnMode.MouseButton1Click:Connect(function()
 	btnMode.Text = (State.mode == "hold")
 		and "Mode: Hold-only"
 		or  "Mode: Locked aim"
+	saveCfg()
 end)
 
 btnAdvance.MouseButton1Click:Connect(function()
@@ -445,6 +544,7 @@ btnAdvance.MouseButton1Click:Connect(function()
 	btnAdvance.Text = State.advance
 		and "Auto-advance: ON (skip cutscenes)"
 		or  "Auto-advance: OFF"
+	saveCfg()
 end)
 
 btnCapture.MouseButton1Click:Connect(function()
@@ -456,11 +556,13 @@ btnCapture.MouseButton1Click:Connect(function()
 	task.delay(1.5, function()
 		btnCapture.Text = "📍  Lock Aim (point first)"
 	end)
+	saveCfg()
 end)
 
 btnWalk.MouseButton1Click:Connect(function()
 	State.walk = (State.walk == 0 and -1) or (State.walk == -1 and 1) or 0
 	btnWalk.Text = "Walk: " .. (State.walk == 0 and "Off" or (State.walk < 0 and "◀ Left" or "Right ▶"))
+	saveCfg()
 end)
 
 capBox.FocusLost:Connect(function()
@@ -471,6 +573,44 @@ capBox.FocusLost:Connect(function()
 	else
 		capBox.Text = tostring(State.cap)
 	end
+	saveCfg()
+end)
+
+btnRevive.MouseButton1Click:Connect(function()
+	State.autoRevive = not State.autoRevive
+	btnRevive.Text = "Auto-revive: " .. (State.autoRevive and "ON" or "OFF")
+	saveCfg()
+end)
+
+btnIdle.MouseButton1Click:Connect(function()
+	State.antiIdle = not State.antiIdle
+	btnIdle.Text = "Anti-idle: " .. (State.antiIdle and "ON" or "OFF")
+	saveCfg()
+end)
+
+btnRejoin.MouseButton1Click:Connect(function()
+	State.autoRejoin = not State.autoRejoin
+	btnRejoin.Text = "Auto-rejoin: " .. (State.autoRejoin and "ON" or "OFF")
+	saveCfg()
+end)
+
+-- Minimize: hide body controls; the auto-sized panel shrinks to the title.
+local bodyControls = {
+	btnMaster, btnMode, btnAdvance, btnCapture, btnWalk,
+	btnRevive, btnIdle, btnRejoin, capBox, lblEmbers, lblStats, lblStatus,
+}
+local function setMinimized(v)
+	State.minimized = v
+	for _, c in ipairs(bodyControls) do c.Visible = not v end
+	btnMin.Text = v and "+" or "–"
+end
+btnMin.MouseButton1Click:Connect(function() setMinimized(not State.minimized) end)
+
+-- Hotkey: RightShift hides/shows the whole panel (desktop convenience).
+UserInputService.InputBegan:Connect(function(input, gp)
+	if not gp and input.KeyCode == Enum.KeyCode.RightShift then
+		root.Visible = not root.Visible
+	end
 end)
 
 --=====================================================================
@@ -478,17 +618,31 @@ end)
 --=====================================================================
 task.spawn(function()
 	while gui.Parent do
-		-- Embers readout + cap enforcement.
+		-- Embers readout + rate + session earned + cap enforcement.
 		local e = readEmbers()
 		if e then
 			State.embers = e
+			if State.startEmbers == nil then State.startEmbers = e end
+			-- Rolling embers/sec over the sample gap.
+			local now = os.clock()
+			if State._rE ~= nil and now > State._rT then
+				State.rate = (e - State._rE) / (now - State._rT)
+			end
+			State._rE, State._rT = e, now
+
 			lblEmbers.Text = "Embers: " .. fmt(e) .. "  /  cap " .. fmt(State.cap)
+			lblStats.Text = string.format("+%s/s · session +%s · rounds %d",
+				fmt(math.max(0, State.rate)),
+				fmt(math.max(0, e - (State.startEmbers or e))),
+				State.rounds)
+
 			if State.on and e >= State.cap then
 				setMaster(false)
 				lblStatus.Text = "Status: reached cap — stopped ✅"
 			end
 		else
 			lblEmbers.Text = "Embers: (enter a round to read)"
+			lblStats.Text  = "rounds " .. State.rounds
 		end
 
 		if not State.on then
@@ -513,6 +667,54 @@ task.spawn(function()
 				act, State.phase, State.forced, pend)
 		end
 		task.wait(0.5)
+	end
+end)
+
+--=====================================================================
+--  8b. LOAD SETTINGS · ANTI-IDLE · AUTO-REJOIN
+--=====================================================================
+loadCfg()
+
+-- Anti-idle: defeat the ~20-minute AFK disconnect by nudging VirtualUser.
+pcall(function()
+	local VirtualUser = game:GetService("VirtualUser")
+	LocalPlayer.Idled:Connect(function()
+		if State.antiIdle then
+			pcall(function()
+				VirtualUser:CaptureController()
+				VirtualUser:ClickButton2(Vector2.new())
+			end)
+		end
+	end)
+end)
+
+-- Auto-rejoin (best-effort, varies by executor): when the disconnect prompt
+-- appears, teleport back into the same place. Only scans while enabled.
+task.spawn(function()
+	local TeleportService = game:GetService("TeleportService")
+	local CoreGui = game:GetService("CoreGui")
+	while task.wait(3) do
+		if State.autoRejoin then
+			local disc = false
+			pcall(function()
+				for _, g in ipairs(CoreGui:GetDescendants()) do
+					if g:IsA("TextLabel") or g:IsA("TextButton") then
+						local t = string.lower(tostring(g.Text))
+						if t:find("disconnect") or t:find("lost connection")
+							or t:find("reconnect") or t:find("rejoin") then
+							disc = true
+							break
+						end
+					end
+				end
+			end)
+			if disc then
+				pcall(function()
+					TeleportService:Teleport(game.PlaceId, LocalPlayer)
+				end)
+				task.wait(10) -- let the teleport resolve; don't spam
+			end
+		end
 	end
 end)
 
